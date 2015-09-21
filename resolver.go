@@ -3,11 +3,11 @@ package recursive
 import (
 	//	"errors"
 	"fmt"
+	"github.com/hashicorp/golang-lru"
 	"github.com/miekg/dns"
 	"log"
 	"math/rand"
 	"sort"
-	"sync"
 	"time"
 )
 
@@ -17,16 +17,14 @@ type cachekey struct {
 }
 
 type Resolver struct {
-	cache     map[cachekey]*dns.Msg
-	lock      *sync.RWMutex
+	cache     *lru.Cache
 	Roothints []string
 	Debug     bool
 }
 
 func NewResolver() *Resolver {
 	r := &Resolver{}
-	r.cache = make(map[cachekey]*dns.Msg)
-	r.lock = &sync.RWMutex{}
+	r.cache, _ = lru.New(10000)
 	r.Roothints = []string{"198.41.0.4",
 		"192.228.79.201",
 		"192.33.4.12",
@@ -88,13 +86,19 @@ func (r *Resolver) resolve(question dns.Question, result *dns.Msg, servers, orig
 	//Pick a server randomly
 	shuffle(servers)
 	server := servers[0] + ":53"
-	servers = servers[1:]
+	nservers := []string{}
+	for i, s := range servers {
+		if i != 0 {
+			nservers = append(nservers, s)
+		}
+	}
 	if r.Debug {
 		log.Println(server)
-		log.Println(servers)
+		log.Println(nservers)
 	}
 	m := &dns.Msg{}
 	m.SetQuestion(question.Name, question.Qtype)
+	m.RecursionDesired = false
 	res, err := r.exchange(m, server, original)
 	if r.Debug {
 		if err != nil {
@@ -102,13 +106,16 @@ func (r *Resolver) resolve(question dns.Question, result *dns.Msg, servers, orig
 		}
 	}
 	if err != nil {
+		if r.Debug {
+			log.Println(err)
+		}
 		//Restart with remaining servers
-		return r.resolve(question, result, servers, original, loopcount)
+		return r.resolve(question, result, nservers, original, loopcount)
 	}
 	//Check status...
 	if res.Rcode != dns.RcodeSuccess {
 		//Restart with remaining servers
-		return r.resolve(question, result, servers, original, loopcount)
+		return r.resolve(question, result, nservers, original, loopcount)
 	}
 	answerfound := false
 	var cname dns.Question
@@ -137,7 +144,9 @@ func (r *Resolver) resolve(question dns.Question, result *dns.Msg, servers, orig
 	ns := make(map[string]string)
 	for _, n := range res.Ns {
 		nsrec, _ := n.(*dns.NS)
-		ns[nsrec.Ns] = ""
+		if nsrec != nil {
+			ns[nsrec.Ns] = ""
+		}
 	}
 	//Try to populate ips from additional...
 	for _, a := range res.Extra {
@@ -156,6 +165,7 @@ func (r *Resolver) resolve(question dns.Question, result *dns.Msg, servers, orig
 			nsmsg := &dns.Msg{}
 			nsmsg.SetQuestion(k, dns.TypeA)
 			//Lets cheat and ask a recursive...
+			nsmsg.RecursionDesired = true
 			nsres, err := r.exchange(nsmsg, "8.8.8.8:53", []string{"8.8.8.8"})
 			if err == nil {
 				for _, ans := range nsres.Answer {
@@ -176,7 +186,7 @@ func (r *Resolver) resolve(question dns.Question, result *dns.Msg, servers, orig
 	}
 	if len(newservers) == 0 {
 		//Restart
-		return r.resolve(question, result, servers, original, loopcount)
+		return r.resolve(question, result, nservers, original, loopcount)
 		//return nil, errors.New("No NS record")
 	}
 	return r.resolve(question, result, newservers, newservers, 0)
@@ -190,13 +200,13 @@ func (r *Resolver) exchange(m *dns.Msg, a string, original []string) (res *dns.M
 	if r.Debug {
 		log.Println("KEY: ", key)
 	}
-	r.lock.RLock()
-	res, ok := r.cache[key]
-	r.lock.RUnlock()
+	rt, ok := r.cache.Get(key)
 	if ok {
 		if r.Debug {
 			log.Println("Cache HIT")
 		}
+		r1 := rt.(*dns.Msg)
+		res = r1.Copy()
 		return
 	}
 	if r.Debug {
@@ -205,7 +215,31 @@ func (r *Resolver) exchange(m *dns.Msg, a string, original []string) (res *dns.M
 	}
 	res, err = dns.Exchange(m, a)
 	if err != nil {
+		if r.Debug {
+			log.Println(err)
+		}
 		return
+	}
+	//Retry in case it was truncated
+	if res.Truncated {
+		if r.Debug {
+			log.Println("truncated, retrying with tcp")
+		}
+
+		cl := new(dns.Client)
+		cl.Net = "tcp"
+		res, _, err = cl.Exchange(m, a)
+		if err != nil {
+			if r.Debug {
+				log.Println(err)
+			}
+			return
+		}
+
+	}
+
+	if r.Debug {
+		log.Println(res)
 	}
 	if res.Rcode != dns.RcodeSuccess {
 		return
@@ -213,8 +247,6 @@ func (r *Resolver) exchange(m *dns.Msg, a string, original []string) (res *dns.M
 	if r.Debug {
 		log.Println("Inserting into cache")
 	}
-	r.lock.Lock()
-	r.cache[key] = res
-	r.lock.Unlock()
+	r.cache.Add(key, res)
 	return
 }
